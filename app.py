@@ -26,6 +26,22 @@ def get_supabase():
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
+@st.cache_data(ttl=600)
+def load_approved_examples(n: int = 2) -> list[dict]:
+    """Fetch n approved breeds to use as few-shot prompt examples."""
+    sb = get_supabase()
+    from ai_assistant import TEXT_FIELDS
+    fields = ",".join(["name"] + TEXT_FIELDS)
+    resp = (
+        sb.table("breeds")
+        .select(fields)
+        .eq("content_status", "approved")
+        .limit(n)
+        .execute()
+    )
+    return resp.data or []
+
+
 @st.cache_data(ttl=300)
 def load_breeds() -> list[dict]:
     sb = get_supabase()
@@ -188,7 +204,8 @@ def render_ai_panel(breed: dict, detail: dict, field_options: list[str], panel_k
         with st.spinner(f"Generating suggestions for {active_field.replace('_', ' ')}…"):
             try:
                 suggestions = generate_suggestions(
-                    clicked_action, active_field, current_text, {**breed, **detail}
+                    clicked_action, active_field, current_text, {**breed, **detail},
+                    examples=load_approved_examples(),
                 )
                 st.session_state.suggestions[active_field] = suggestions
             except ValueError as e:
@@ -570,7 +587,8 @@ def render_workshop_tab(breed: dict, detail: dict) -> None:
         with st.spinner(f"Expanding seed for {active_field.replace('_', ' ')}…"):
             try:
                 suggestions = generate_seed_suggestions(
-                    active_field, seed_input, {**breed, **detail}
+                    active_field, seed_input, {**breed, **detail},
+                    examples=load_approved_examples(),
                 )
                 st.session_state.workshop_suggestions[active_field] = suggestions
             except ValueError as e:

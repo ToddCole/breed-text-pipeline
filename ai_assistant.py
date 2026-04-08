@@ -182,7 +182,21 @@ def build_trait_summary(breed: dict) -> str:
     return ", ".join(parts) if parts else "no trait data available"
 
 
-def build_user_prompt(action: str, field: str, current_text: str, breed: dict) -> str:
+def _build_examples_block(field: str, examples: list[dict]) -> str:
+    """Format approved breed examples for injection into prompts."""
+    parts = []
+    for ex in examples:
+        val = (ex.get(field) or "").strip()
+        if val:
+            parts.append(f"Breed: {ex.get('name', 'Unknown')}\n{field.replace('_', ' ').title()}: {val}")
+    if not parts:
+        return ""
+    joined = "\n\n".join(parts)
+    return f"Reference examples (approved copy — match this voice and specificity):\n\n{joined}"
+
+
+def build_user_prompt(action: str, field: str, current_text: str, breed: dict,
+                      examples: list[dict] | None = None) -> str:
     target_length = _TARGET_LENGTHS.get(field, "an appropriate length")
     instruction = _ACTION_INSTRUCTIONS[action].format(
         field=field.replace("_", " "),
@@ -198,10 +212,19 @@ def build_user_prompt(action: str, field: str, current_text: str, breed: dict) -
     else:
         base = f"{prefix}{instruction}"
 
-    return f"{base}\n\n{field_note}" if field_note else base
+    if field_note:
+        base = f"{base}\n\n{field_note}"
+
+    if examples:
+        examples_block = _build_examples_block(field, examples)
+        if examples_block:
+            base = f"{base}\n\n{examples_block}"
+
+    return base
 
 
-def build_seed_prompt(field: str, seed_text: str, breed: dict) -> str:
+def build_seed_prompt(field: str, seed_text: str, breed: dict,
+                      examples: list[dict] | None = None) -> str:
     field_display = field.replace("_", " ")
     target_length = _TARGET_LENGTHS.get(field, "an appropriate length")
     field_note = _FIELD_NOTES.get(field, "")
@@ -216,12 +239,21 @@ def build_seed_prompt(field: str, seed_text: str, breed: dict) -> str:
         f"Do not replace it with generic dog-guide content. "
         f"Avoid sentence structures and phrases typical of dog guides."
     )
-    return f"{base}\n\n{field_note}" if field_note else base
+    if field_note:
+        base = f"{base}\n\n{field_note}"
+
+    if examples:
+        examples_block = _build_examples_block(field, examples)
+        if examples_block:
+            base = f"{base}\n\n{examples_block}"
+
+    return base
 
 
-def _call_seed_api(field: str, seed_text: str, breed: dict) -> str:
+def _call_seed_api(field: str, seed_text: str, breed: dict,
+                   examples: list[dict] | None = None) -> str:
     client = get_anthropic_client()
-    prompt = build_seed_prompt(field, seed_text, breed)
+    prompt = build_seed_prompt(field, seed_text, breed, examples=examples)
     max_tokens = _TOKEN_LIMITS.get(field, _DEFAULT_TOKEN_LIMIT)
     message = client.messages.create(
         model="claude-opus-4-6",
@@ -232,16 +264,21 @@ def _call_seed_api(field: str, seed_text: str, breed: dict) -> str:
     return message.content[0].text.strip()
 
 
-def generate_seed_suggestions(field: str, seed_text: str, breed: dict, n: int = 2) -> list[str]:
+def generate_seed_suggestions(field: str, seed_text: str, breed: dict, n: int = 2,
+                               examples: list[dict] | None = None) -> list[str]:
     """Generate n suggestions that expand/improve user-supplied seed text."""
     with ThreadPoolExecutor(max_workers=n) as executor:
-        futures = [executor.submit(_call_seed_api, field, seed_text, breed) for _ in range(n)]
+        futures = [
+            executor.submit(_call_seed_api, field, seed_text, breed, examples)
+            for _ in range(n)
+        ]
         return [f.result() for f in futures]
 
 
-def _call_api(action: str, field: str, current_text: str, breed: dict) -> str:
+def _call_api(action: str, field: str, current_text: str, breed: dict,
+              examples: list[dict] | None = None) -> str:
     client = get_anthropic_client()
-    prompt = build_user_prompt(action, field, current_text, breed)
+    prompt = build_user_prompt(action, field, current_text, breed, examples=examples)
     max_tokens = _TOKEN_LIMITS.get(field, _DEFAULT_TOKEN_LIMIT)
 
     message = client.messages.create(
@@ -258,12 +295,13 @@ def generate_suggestions(
     field: str,
     current_text: str,
     breed: dict,
-    n: int = 1,
+    n: int = 2,
+    examples: list[dict] | None = None,
 ) -> list[str]:
     """Return n suggestions by running n API calls near-concurrently."""
     with ThreadPoolExecutor(max_workers=n) as executor:
         futures = [
-            executor.submit(_call_api, action, field, current_text, breed)
+            executor.submit(_call_api, action, field, current_text, breed, examples)
             for _ in range(n)
         ]
         results = [f.result() for f in futures]
