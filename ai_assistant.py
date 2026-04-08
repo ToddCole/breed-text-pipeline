@@ -201,6 +201,44 @@ def build_user_prompt(action: str, field: str, current_text: str, breed: dict) -
     return f"{base}\n\n{field_note}" if field_note else base
 
 
+def build_seed_prompt(field: str, seed_text: str, breed: dict) -> str:
+    field_display = field.replace("_", " ")
+    target_length = _TARGET_LENGTHS.get(field, "an appropriate length")
+    field_note = _FIELD_NOTES.get(field, "")
+    base = (
+        f"Breed: {breed.get('name', 'Unknown')}\n"
+        f"Traits: {build_trait_summary(breed)}\n"
+        f"Section: {field_display}\n\n"
+        f"Seed text:\n{seed_text.strip()}\n\n"
+        f"Treat the seed text above as the creative direction. "
+        f"Improve and expand it into a complete {field_display} "
+        f"in the Pawfect Match voice. Aim for {target_length}. "
+        f"Do not replace it with generic dog-guide content. "
+        f"Avoid sentence structures and phrases typical of dog guides."
+    )
+    return f"{base}\n\n{field_note}" if field_note else base
+
+
+def _call_seed_api(field: str, seed_text: str, breed: dict) -> str:
+    client = get_anthropic_client()
+    prompt = build_seed_prompt(field, seed_text, breed)
+    max_tokens = _TOKEN_LIMITS.get(field, _DEFAULT_TOKEN_LIMIT)
+    message = client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=max_tokens,
+        system=_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return message.content[0].text.strip()
+
+
+def generate_seed_suggestions(field: str, seed_text: str, breed: dict, n: int = 2) -> list[str]:
+    """Generate n suggestions that expand/improve user-supplied seed text."""
+    with ThreadPoolExecutor(max_workers=n) as executor:
+        futures = [executor.submit(_call_seed_api, field, seed_text, breed) for _ in range(n)]
+        return [f.result() for f in futures]
+
+
 def _call_api(action: str, field: str, current_text: str, breed: dict) -> str:
     client = get_anthropic_client()
     prompt = build_user_prompt(action, field, current_text, breed)
