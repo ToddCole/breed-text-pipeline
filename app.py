@@ -14,6 +14,7 @@ from ai_assistant import (  # noqa: E402
     TEXT_FIELDS,
     TRAIT_FIELDS,
     generate_suggestions,
+    generate_seed_suggestions,
 )
 
 
@@ -23,6 +24,22 @@ from ai_assistant import (  # noqa: E402
 def get_supabase():
     from supabase import create_client
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+
+@st.cache_data(ttl=600)
+def load_approved_examples(n: int = 2) -> list[dict]:
+    """Fetch n approved breeds to use as few-shot prompt examples."""
+    sb = get_supabase()
+    from ai_assistant import TEXT_FIELDS
+    fields = ",".join(["name"] + TEXT_FIELDS)
+    resp = (
+        sb.table("breeds")
+        .select(fields)
+        .eq("content_status", "approved")
+        .limit(n)
+        .execute()
+    )
+    return resp.data or []
 
 
 @st.cache_data(ttl=300)
@@ -67,6 +84,9 @@ def _init_session():
         "dirty": False,
         "suggestions": {},
         "ai_loading_field": None,
+        "workshop_seeds": {},
+        "workshop_suggestions": {},
+        "workshop_loading_field": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -184,7 +204,8 @@ def render_ai_panel(breed: dict, detail: dict, field_options: list[str], panel_k
         with st.spinner(f"Generating suggestions for {active_field.replace('_', ' ')}…"):
             try:
                 suggestions = generate_suggestions(
-                    clicked_action, active_field, current_text, {**breed, **detail}
+                    clicked_action, active_field, current_text, {**breed, **detail},
+                    examples=load_approved_examples(),
                 )
                 st.session_state.suggestions[active_field] = suggestions
             except ValueError as e:
@@ -510,6 +531,111 @@ def render_preview_tab(breed: dict, detail: dict) -> None:
                     )
 
 
+# ── Workshop tab ─────────────────────────────────────────────────────────────────
+
+def render_workshop_tab(breed: dict, detail: dict) -> None:
+    breed_id = breed["id"]
+    status = breed.get("content_status") or "pending"
+
+    if not st.session_state.draft:
+        st.session_state.draft = {f: detail.get(f) or "" for f in TEXT_FIELDS}
+        st.session_state.dirty = False
+
+    st.subheader("Workshop")
+    st.caption(
+        "Type a seed idea or creative angle, then let Claude expand it into finished copy "
+        "that stays true to your direction."
+    )
+    st.divider()
+
+    active_field = st.selectbox(
+        "Field to work on",
+        options=CORE_TEXT_FIELDS,
+        format_func=lambda f: f.replace("_", " ").title(),
+        key=f"ws_field_{breed_id}",
+    )
+
+    current_seed = st.session_state.workshop_seeds.get(active_field, "")
+    seed_input = st.text_area(
+        "Seed idea / creative direction",
+        value=current_seed,
+        height=120,
+        key=f"ws_seed_{breed_id}_{active_field}",
+        placeholder=(
+            'E.g. "This breed thinks it runs the house. It\'s right." '
+            'or "Velcro dog who invented the concept of personal space violation."'
+        ),
+    )
+
+    if seed_input != st.session_state.workshop_seeds.get(active_field, ""):
+        st.session_state.workshop_seeds[active_field] = seed_input
+
+    current_field_text = st.session_state.draft.get(active_field, "")
+    if current_field_text:
+        with st.expander("Current field content (for reference)"):
+            st.write(current_field_text)
+
+    loading = st.session_state.workshop_loading_field == active_field
+    if st.button(
+        "Improve Seed",
+        key=f"ws_improve_{breed_id}_{active_field}",
+        type="primary",
+        disabled=loading or not seed_input.strip(),
+    ):
+        st.session_state.workshop_loading_field = active_field
+        st.session_state.workshop_suggestions.pop(active_field, None)
+        with st.spinner(f"Expanding seed for {active_field.replace('_', ' ')}…"):
+            try:
+                suggestions = generate_seed_suggestions(
+                    active_field, seed_input, {**breed, **detail},
+                    examples=load_approved_examples(),
+                )
+                st.session_state.workshop_suggestions[active_field] = suggestions
+            except ValueError as e:
+                st.error(str(e))
+            except Exception as e:
+                st.error(f"AI error: {e}")
+        st.session_state.workshop_loading_field = None
+        st.rerun()
+
+    field_suggestions = st.session_state.workshop_suggestions.get(active_field, [])
+    if field_suggestions:
+        st.divider()
+        st.caption(f"Suggestions for **{active_field.replace('_', ' ').title()}**")
+        for idx, suggestion in enumerate(field_suggestions):
+            with st.container(border=True):
+                st.write(suggestion)
+                a_col, d_col = st.columns(2)
+                with a_col:
+                    if st.button(
+                        "✓ Accept",
+                        key=f"ws_accept_{breed_id}_{active_field}_{idx}",
+                        use_container_width=True,
+                        type="primary",
+                    ):
+                        updates = {active_field: suggestion}
+                        if status == "pending":
+                            updates["content_status"] = "in_progress"
+                        save_breed_fields(breed_id, updates)
+                        st.session_state.draft[active_field] = suggestion
+                        st.session_state[f"accept_pending_{breed_id}_{active_field}"] = suggestion
+                        st.session_state.dirty = False
+                        st.session_state.workshop_suggestions.pop(active_field, None)
+                        st.rerun()
+                with d_col:
+                    if st.button(
+                        "✕ Discard",
+                        key=f"ws_discard_{breed_id}_{active_field}_{idx}",
+                        use_container_width=True,
+                    ):
+                        remaining = [s for i, s in enumerate(field_suggestions) if i != idx]
+                        if remaining:
+                            st.session_state.workshop_suggestions[active_field] = remaining
+                        else:
+                            st.session_state.workshop_suggestions.pop(active_field, None)
+                        st.rerun()
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────────
 
 def _do_save(breed_id: str, current_status: str):
@@ -528,6 +654,9 @@ def _switch_breed(new_id: str):
     st.session_state.dirty = False
     st.session_state.suggestions = {}
     st.session_state.ai_loading_field = None
+    st.session_state.workshop_seeds = {}
+    st.session_state.workshop_suggestions = {}
+    st.session_state.workshop_loading_field = None
     st.rerun()
 
 
@@ -557,11 +686,13 @@ def main():
 
     detail = load_breed_detail(selected_id)
 
-    edit_tab, seo_tab, preview_tab = st.tabs(["✏️ Edit", "🔍 SEO", "👁 Preview"])
+    edit_tab, seo_tab, workshop_tab, preview_tab = st.tabs(["✏️ Edit", "🔍 SEO", "Workshop", "👁 Preview"])
     with edit_tab:
         render_edit_tab(breed, detail)
     with seo_tab:
         render_seo_tab(breed, detail)
+    with workshop_tab:
+        render_workshop_tab(breed, detail)
     with preview_tab:
         render_preview_tab(breed, detail)
 
